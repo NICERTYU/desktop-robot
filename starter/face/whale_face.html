@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>鲸鱼娘 · 表情屏（同人风格）</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #04101f;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none;
+  }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { width: min(100vw, 166.66vh); height: auto; display: block; cursor: pointer; }
+  #hint {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    color: #6f9fc4; font-size: 13px; letter-spacing: .05em; white-space: nowrap;
+    text-shadow: 0 1px 6px #000;
+  }
+  #stateLabel {
+    position: fixed; top: 14px; right: 18px; color: #7fb7d8;
+    font-size: 12px; letter-spacing: .18em;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="face" width="1200" height="720"></canvas></div>
+<div id="hint">1 待机 · 2 倾听 · 3 思考 · 4 说话 · 5 开心 · 6 难过 · 7 惊讶 · 8 睡觉　（点击画面切换）</div>
+<div id="stateLabel"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('face');
+  const ctx = canvas.getContext('2d');
+  const labelEl = document.getElementById('stateLabel');
+  const W = canvas.width;
+  const H = canvas.height;
+  const CX = W / 2;
+
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  // 所有表情都是一组参数，切换时做缓动
+  const STATE_DEFS = {
+    idle:      { eyeOpen: 0.95, pupilX: 0,    pupilY: 0,    brow: 0.00,  mouth: 0.06, curve: 0.30,  blush: 0.18, eyeCurve: 0, tilt: 0.000, ear: 0.00, tear: 0, sparkle: 0, zzz: 0, spout: 0, breathe: 1.00 },
+    listen:    { eyeOpen: 1.08, pupilX: 0,    pupilY: -0.05, brow: 0.18,  mouth: 0.12, curve: 0.25,  blush: 0.22, eyeCurve: 0, tilt: -0.015, ear: 0.45, tear: 0, sparkle: 0, zzz: 0, spout: 0, breathe: 1.15 },
+    think:     { eyeOpen: 0.80, pupilX: 0.42, pupilY: -0.55, brow: 0.30,  mouth: 0.05, curve: 0.00,  blush: 0.10, eyeCurve: 0, tilt: 0.035, ear: 0.10, tear: 0, sparkle: 0, zzz: 0, spout: 0, breathe: 0.75 },
+    speak:     { eyeOpen: 1.00, pupilX: 0,    pupilY: 0,    brow: 0.08,  mouth: 0.30, curve: 0.30,  blush: 0.25, eyeCurve: 0, tilt: 0.000, ear: 0.05, tear: 0, sparkle: 0, zzz: 0, spout: 0, breathe: 0.95 },
+    happy:     { eyeOpen: 1.00, pupilX: 0,    pupilY: 0,    brow: 0.45,  mouth: 0.52, curve: 0.90,  blush: 0.80, eyeCurve: 1, tilt: 0.000, ear: 0.55, tear: 0, sparkle: 1, zzz: 0, spout: 1, breathe: 1.10 },
+    sad:       { eyeOpen: 0.86, pupilX: 0,    pupilY: 0.45, brow: -0.50, mouth: 0.05, curve: -0.60, blush: 0.10, eyeCurve: 0, tilt: 0.045, ear: -0.35, tear: 1, sparkle: 0, zzz: 0, spout: 0, breathe: 0.60 },
+    surprised: { eyeOpen: 1.25, pupilX: 0,    pupilY: 0,    brow: 0.75,  mouth: 0.62, curve: 0.05,  blush: 0.20, eyeCurve: 0, tilt: 0.000, ear: 0.65, tear: 0, sparkle: 0, zzz: 0, spout: 1, breathe: 0.55 },
+    sleep:     { eyeOpen: 0.02, pupilX: 0,    pupilY: 0.1,  brow: -0.15, mouth: 0.03, curve: 0.15,  blush: 0.12, eyeCurve: 0, tilt: 0.070, ear: -0.20, tear: 0, sparkle: 0, zzz: 1, spout: 0, breathe: 0.35 },
+  };
+  const STATE_ORDER = ['idle', 'listen', 'think', 'speak', 'happy', 'sad', 'surprised', 'sleep'];
+  const STATE_LABELS = {
+    idle: '待机', listen: '倾听', think: '思考', speak: '说话',
+    happy: '开心', sad: '难过', surprised: '惊讶', sleep: '睡觉',
+  };
+
+  let stateName = 'idle';
+  let cur = { ...STATE_DEFS.idle };
+  let tgt = { ...STATE_DEFS.idle };
+  let elapsed = 0;
+  let last = performance.now();
+  const mouse = { x: 0, y: 0 };
+
+  // 眨眼
+  let blinkAt = performance.now() + 2200;
+  let blinkStart = -1;
+  let blinkDur = 160;
+
+  function blinkFactor(now) {
+    if (blinkStart < 0) return 1;
+    const p = (now - blinkStart) / blinkDur;
+    if (p >= 1) {
+      blinkStart = -1;
+      blinkAt = now + 2200 + Math.random() * 3600;
+      if (Math.random() < 0.2) blinkAt = now + 170;
+      return 1;
+    }
+    return Math.abs(Math.cos(Math.PI * p));
+  }
+
+  function scheduleBlink(now) {
+    if (blinkStart < 0 && now >= blinkAt) {
+      blinkStart = now;
+      blinkDur = 130 + Math.random() * 60;
+    }
+  }
+
+  // 气泡粒子
+  const bubbles = Array.from({ length: 24 }, () => ({
+    x: Math.random() * W,
+    y: Math.random() * H,
+    r: 2 + Math.random() * 9,
+    speed: 8 + Math.random() * 26,
+    alpha: 0.05 + Math.random() * 0.2,
+    sway: Math.random() * Math.PI * 2,
+  }));
+
+  function setState(name) {
+    if (!STATE_DEFS[name]) return;
+    stateName = name;
+    labelEl.textContent = STATE_LABELS[name] || name;
+  }
+
+  window.faceAPI = {
+    setState,
+    get state() { return stateName; },
+  };
+
+  function update(dt, now) {
+    scheduleBlink(now);
+    tgt = { ...STATE_DEFS[stateName] };
+
+    if (stateName === 'idle' || stateName === 'listen') {
+      tgt.pupilX = mouse.x * 0.30;
+      tgt.pupilY = mouse.y * 0.25;
+    }
+
+    const k = 1 - Math.pow(0.001, dt);
+    for (const key of Object.keys(cur)) {
+      cur[key] = lerp(cur[key], tgt[key] ?? 0, k);
+    }
+    elapsed += dt;
+
+    for (const b of bubbles) {
+      b.y -= b.speed * dt;
+      b.sway += dt * 1.2;
+      if (b.y < -20) {
+        b.y = H + 20;
+        b.x = Math.random() * W;
+      }
+    }
+  }
+
+  // ---------- 背景 ----------
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0a2b4a');
+    g.addColorStop(0.55, '#071d33');
+    g.addColorStop(1, '#030b16');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // 光柱
+    ctx.save();
+    ctx.globalAlpha = 0.06;
+    for (let i = 0; i < 4; i++) {
+      const x = 180 + i * 300;
+      const ray = ctx.createLinearGradient(x, 0, x + 120, H);
+      ray.addColorStop(0, 'rgba(140,220,255,0.9)');
+      ray.addColorStop(1, 'rgba(140,220,255,0)');
+      ctx.fillStyle = ray;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x + 90, 0);
+      ctx.lineTo(x + 300, H);
+      ctx.lineTo(x + 120, H);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+
+    drawBubbles(0.6);
+  }
+
+  function drawBubbles(scale = 1) {
+    for (const b of bubbles) {
+      const x = b.x + Math.sin(b.sway) * 8;
+      ctx.beginPath();
+      ctx.arc(x, b.y, b.r * scale, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(140,220,255,${b.alpha * scale})`;
+      ctx.fill();
+      ctx.strokeStyle = `rgba(190,240,255,${b.alpha * 0.8 * scale})`;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  // ---------- 头发 ----------
+  function drawHairBack() {
+    const g = ctx.createLinearGradient(300, 100, 900, 650);
+    g.addColorStop(0, '#2a6fae');
+    g.addColorStop(0.55, '#1d4f85');
+    g.addColorStop(1, '#12345c');
+
+    // 后发
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(CX, 340, 272, 292, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 两侧长发
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(CX + side * 200, 240);
+      ctx.bezierCurveTo(CX + side * 300, 360, CX + side * 300, 520, CX + side * 250, 660);
+      ctx.bezierCurveTo(CX + side * 210, 700, CX + side * 160, 660, CX + side * 175, 600);
+      ctx.bezierCurveTo(CX + side * 190, 500, CX + side * 160, 380, CX + side * 145, 300);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // 后发高光
+    ctx.strokeStyle = 'rgba(126,206,255,0.20)';
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.ellipse(CX, 360, 220, 240, 0, Math.PI * 1.05, Math.PI * 1.55);
+    ctx.stroke();
+  }
+
+  function drawBody() {
+    // 脖子
+    const ng = ctx.createLinearGradient(0, 520, 0, 640);
+    ng.addColorStop(0, '#ffe9dd');
+    ng.addColorStop(1, '#f0c9ba');
+    ctx.fillStyle = ng;
+    ctx.beginPath();
+    ctx.ellipse(CX, 585, 54, 72, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 肩膀
+    const g = ctx.createLinearGradient(0, 600, 0, 720);
+    g.addColorStop(0, '#12385f');
+    g.addColorStop(1, '#081b30');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(170, 720);
+    ctx.bezierCurveTo(230, 642, 400, 608, 600, 608);
+    ctx.bezierCurveTo(800, 608, 970, 642, 1030, 720);
+    ctx.closePath();
+    ctx.fill();
+
+    // 水手领
+    ctx.fillStyle = '#eaf7ff';
+    ctx.beginPath();
+    ctx.moveTo(520, 606);
+    ctx.quadraticCurveTo(600, 668, 680, 606);
+    ctx.lineTo(658, 592);
+    ctx.quadraticCurveTo(600, 640, 542, 592);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = '#3f9fd8';
+    ctx.lineWidth = 8;
+    ctx.beginPath();
+    ctx.moveTo(530, 614);
+    ctx.quadraticCurveTo(600, 664, 670, 614);
+    ctx.stroke();
+  }
+
+  function drawFace() {
+    const g = ctx.createRadialGradient(CX - 40, 300, 40, CX, 350, 220);
+    g.addColorStop(0, '#fff6ef');
+    g.addColorStop(0.7, '#ffe9dd');
+    g.addColorStop(1, '#f3cfc2');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.ellipse(CX, 350, 178, 205, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 下巴阴影
+    ctx.fillStyle = 'rgba(210,150,140,0.12)';
+    ctx.beginPath();
+    ctx.ellipse(CX, 500, 90, 30, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawFinEars() {
+    for (const side of [-1, 1]) {
+      const angle = cur.ear * 0.35 * side;
+      ctx.save();
+      ctx.translate(CX + side * 246, 400);
+      ctx.rotate(side * (-0.18 + angle));
+      const g = ctx.createLinearGradient(0, -60, 0, 45);
+      g.addColorStop(0, '#8fe0f7');
+      g.addColorStop(1, '#2a6fae');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.moveTo(0, 12);
+      ctx.bezierCurveTo(side * 35, -38, side * 98, -54, side * 124, -20);
+      ctx.bezierCurveTo(side * 96, 2, side * 64, 24, side * 46, 46);
+      ctx.bezierCurveTo(side * 28, 30, side * 10, 20, 0, 12);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(200,245,255,0.5)';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // 鳍的纹路
+      ctx.strokeStyle = 'rgba(220,250,255,0.45)';
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath();
+        ctx.moveTo(side * (30 + i * 18), 4 - i * 10);
+        ctx.quadraticCurveTo(side * (60 + i * 16), -18 - i * 6, side * (86 + i * 10), -22 - i * 4);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawBangs() {
+    const g = ctx.createLinearGradient(380, 120, 820, 330);
+    g.addColorStop(0, '#418ecf');
+    g.addColorStop(0.6, '#22598f');
+    g.addColorStop(1, '#173f68');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(390, 340);
+    ctx.bezierCurveTo(382, 190, 470, 105, 600, 105);
+    ctx.bezierCurveTo(730, 105, 818, 190, 812, 302);
+    // 斜向的齐刘海，平滑收边
+    ctx.bezierCurveTo(780, 288, 740, 286, 700, 292);
+    ctx.bezierCurveTo(640, 298, 580, 302, 520, 308);
+    ctx.bezierCurveTo(470, 314, 430, 322, 390, 340);
+    ctx.closePath();
+    ctx.fill();
+
+    // 侧扫的一缕头发
+    ctx.fillStyle = 'rgba(96,170,220,0.5)';
+    ctx.beginPath();
+    ctx.moveTo(436, 250);
+    ctx.bezierCurveTo(520, 200, 660, 226, 724, 292);
+    ctx.bezierCurveTo(660, 268, 540, 260, 436, 250);
+    ctx.closePath();
+    ctx.fill();
+
+    // 发丝高光
+    ctx.strokeStyle = 'rgba(150,220,255,0.35)';
+    ctx.lineWidth = 6;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(470, 205);
+    ctx.quadraticCurveTo(520, 158, 590, 148);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(650, 156);
+    ctx.quadraticCurveTo(720, 184, 748, 238);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(520, 200);
+    ctx.quadraticCurveTo(548, 250, 540, 305);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(690, 205);
+    ctx.quadraticCurveTo(672, 250, 676, 292);
+    ctx.stroke();
+
+    // 呆毛
+    ctx.strokeStyle = '#3d86c6';
+    ctx.lineWidth = 12;
+    ctx.beginPath();
+    ctx.moveTo(612, 116);
+    ctx.bezierCurveTo(650, 68, 700, 50, 706, 90);
+    ctx.stroke();
+  }
+
+  function drawWhaleTail() {
+    // 头发上的小鲸鱼发夹
+    ctx.save();
+    ctx.translate(CX + 212, 250);
+    ctx.rotate(-0.12);
+    ctx.scale(1.08, 1.08);
+
+    const g = ctx.createLinearGradient(0, -26, 0, 26);
+    g.addColorStop(0, '#93e6ff');
+    g.addColorStop(1, '#2d9bd3');
+
+    // 身体
+    ctx.fillStyle = g;
+    ctx.strokeStyle = 'rgba(210,250,255,0.85)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(-4, 0, 42, 24, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // 肚子
+    ctx.fillStyle = 'rgba(228,251,255,0.78)';
+    ctx.beginPath();
+    ctx.ellipse(-6, 9, 28, 10, 0.05, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 尾鳍
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(32, 0);
+    ctx.bezierCurveTo(48, -20, 66, -26, 84, -40);
+    ctx.bezierCurveTo(74, -10, 74, 10, 84, 40);
+    ctx.bezierCurveTo(66, 24, 48, 14, 32, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // 胸鳍
+    ctx.beginPath();
+    ctx.moveTo(-8, 18);
+    ctx.bezierCurveTo(-18, 34, -34, 40, -42, 36);
+    ctx.bezierCurveTo(-32, 26, -22, 18, -8, 18);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // 眼睛
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(-28, -7, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#0b2a3d';
+    ctx.beginPath();
+    ctx.arc(-28, -7, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 嘴
+    ctx.strokeStyle = 'rgba(20,70,100,0.8)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(-43, 5);
+    ctx.quadraticCurveTo(-36, 9, -28, 8);
+    ctx.stroke();
+
+    // 喷水（从头顶）
+    ctx.fillStyle = 'rgba(205,248,255,0.92)';
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(-16 + (i - 1) * 9, -36 - i * 7, 4 - i * 0.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------- 五官 ----------
+  function drawEyes(now) {
+    const blink = blinkFactor(now);
+    const open = clamp(cur.eyeOpen * blink, 0, 1.5);
+    const dx = 82;
+    const cy = 372;
+
+    for (const side of [-1, 1]) {
+      const ex = CX + side * dx;
+      ctx.save();
+      ctx.translate(ex, cy);
+
+      if (cur.eyeCurve > 0.55) {
+        // 开心 ^ ^
+        const h = 36 * (0.4 + 0.6 * open);
+        ctx.strokeStyle = '#173f68';
+        ctx.lineWidth = 9;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-36, h * 0.5);
+        ctx.quadraticCurveTo(0, -h, 36, h * 0.5);
+        ctx.stroke();
+      } else if (open < 0.08) {
+        // 闭眼
+        ctx.strokeStyle = '#173f68';
+        ctx.lineWidth = 8;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-34, 0);
+        ctx.quadraticCurveTo(0, 10, 34, 0);
+        ctx.stroke();
+        // 睫毛
+        ctx.beginPath();
+        ctx.moveTo(-34, 0);
+        ctx.lineTo(-44, -8);
+        ctx.moveTo(34, 0);
+        ctx.lineTo(44, -8);
+        ctx.stroke();
+      } else {
+        const eh = Math.max(8, 98 * open);
+
+        // 眼白
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 46, eh * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 虹膜
+        const iris = ctx.createLinearGradient(0, -eh * 0.4, 0, eh * 0.5);
+        iris.addColorStop(0, '#0f6f86');
+        iris.addColorStop(0.55, '#25b6c9');
+        iris.addColorStop(1, '#8ff4f0');
+        ctx.fillStyle = iris;
+        ctx.beginPath();
+        ctx.ellipse(
+          cur.pupilX * 14,
+          cur.pupilY * eh * 0.12,
+          28,
+          Math.min(40, eh * 0.40),
+          0,
+          0,
+          Math.PI * 2
+        );
+        ctx.fill();
+
+        // 瞳孔
+        ctx.fillStyle = '#082b3d';
+        ctx.beginPath();
+        ctx.ellipse(
+          cur.pupilX * 14,
+          cur.pupilY * eh * 0.12,
+          13,
+          Math.min(22, eh * 0.22),
+          0,
+          0,
+          Math.PI * 2
+        );
+        ctx.fill();
+
+        // 高光
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        ctx.beginPath();
+        ctx.arc(-10, -eh * 0.16, 9, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(12, eh * 0.13, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 上睫毛
+        ctx.strokeStyle = '#173f68';
+        ctx.lineWidth = 7;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 46, eh * 0.5, 0, Math.PI * 1.08, Math.PI * 1.92);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawBrows() {
+    const angle = -cur.brow * 0.30;
+    for (const side of [-1, 1]) {
+      ctx.save();
+      ctx.translate(CX + side * 82, 312 - Math.max(0, cur.brow) * 12);
+      ctx.rotate(side * angle);
+      ctx.strokeStyle = 'rgba(30,86,140,0.85)';
+      ctx.lineWidth = 7;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(-30, 0);
+      ctx.quadraticCurveTo(0, -8, 30, 0);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  function drawMouth() {
+    const speech = stateName === 'speak'
+      ? 0.34 * Math.abs(Math.sin(elapsed * 11) * Math.sin(elapsed * 5.3 + 0.7))
+      : 0;
+    const m = clamp(cur.mouth + speech, 0, 1);
+    const y = 468;
+    const w = 44 * (1 - 0.25 * m);
+    const sag = cur.curve * 26 + m * 52;
+
+    ctx.save();
+    ctx.translate(CX, y);
+
+    const g = ctx.createLinearGradient(0, -6, 0, sag);
+    g.addColorStop(0, 'rgba(140,220,255,0.25)');
+    g.addColorStop(1, 'rgba(40,20,30,0.9)');
+
+    ctx.beginPath();
+    ctx.moveTo(-w, 0);
+    ctx.quadraticCurveTo(0, sag, w, 0);
+    ctx.quadraticCurveTo(0, -m * 10 - 2, -w, 0);
+    ctx.closePath();
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(120,60,70,0.75)';
+    ctx.stroke();
+
+    // 舌头
+    if (m > 0.35) {
+      ctx.fillStyle = 'rgba(255,140,160,0.75)';
+      ctx.beginPath();
+      ctx.ellipse(0, sag * 0.45, w * 0.5, sag * 0.22, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBlush() {
+    const a = cur.blush;
+    if (a <= 0.01) return;
+    for (const side of [-1, 1]) {
+      const x = CX + side * 132;
+      const y = 432;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, 56);
+      g.addColorStop(0, `rgba(255,120,150,${0.42 * a})`);
+      g.addColorStop(1, 'rgba(255,120,150,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, 56, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawTear() {
+    if (cur.tear < 0.05) return;
+    const t = (elapsed * 0.6) % 1;
+    const x = CX - 78;
+    const y = 402 + t * 46;
+    ctx.fillStyle = `rgba(120,220,255,${0.8 * cur.tear * (1 - t * 0.6)})`;
+    ctx.beginPath();
+    ctx.ellipse(x, y, 9, 14, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawSpout() {
+    if (cur.spout < 0.05) return;
+    ctx.save();
+    ctx.globalAlpha = cur.spout * 0.9;
+    ctx.fillStyle = '#bdefff';
+    const top = 76;
+    for (let i = 0; i < 3; i++) {
+      const t = (elapsed * 1.6 + i * 0.33) % 1;
+      const x = 706 + (i - 1) * 20;
+      const y = top - t * 58;
+      const r = 6 * (1 - t * 0.5);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawSparkles() {
+    if (cur.sparkle < 0.05) return;
+    const spots = [
+      [300, 250, 1.0],
+      [880, 300, 0.8],
+      [820, 470, 0.6],
+      [380, 480, 0.7],
+    ];
+    for (const [x, y, s] of spots) {
+      const tw = 0.6 + 0.4 * Math.sin(elapsed * 3 + x);
+      drawStar(x, y, 12 * s * tw * cur.sparkle);
+    }
+  }
+
+  function drawStar(x, y, r) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = 'rgba(180,245,255,0.85)';
+    ctx.beginPath();
+    for (let i = 0; i < 8; i++) {
+      const a = (Math.PI / 4) * i;
+      const rr = i % 2 === 0 ? r : r * 0.35;
+      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawZzz() {
+    if (cur.zzz < 0.05) return;
+    ctx.save();
+    ctx.globalAlpha = cur.zzz;
+    ctx.fillStyle = '#bdefff';
+    ctx.font = 'bold 34px -apple-system, sans-serif';
+    for (let i = 0; i < 3; i++) {
+      const t = (elapsed * 0.9 + i * 0.33) % 1;
+      ctx.globalAlpha = cur.zzz * (1 - t) * 0.9;
+      ctx.fillText('Z', 236 + i * 38, 230 - t * 70 + i * 8);
+    }
+    ctx.restore();
+  }
+
+  function drawThinkDots() {
+    if (stateName !== 'think') return;
+    const a = 0.7 + 0.3 * Math.sin(elapsed * 4);
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(900 + i * 28, 250 - i * 12, 8 - i, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(160,230,255,${a})`;
+      ctx.fill();
+    }
+  }
+
+  // ---------- 主循环 ----------
+  function draw(now) {
+    drawBackground();
+
+    const breathe = Math.sin(elapsed * 1.5) * 0.006;
+    const bob = Math.sin(elapsed * 1.1) * 3 * (cur.breathe || 1)
+      + (stateName === 'speak' ? Math.sin(elapsed * 8.5) * 2 : 0);
+
+    ctx.save();
+    ctx.translate(CX, 420);
+    ctx.rotate(cur.tilt);
+    ctx.scale(1 + breathe, 1 + breathe);
+    ctx.translate(-CX, -420 + bob);
+
+    drawHairBack();
+    drawBody();
+    drawFace();
+    drawFinEars();
+    drawBangs();
+    drawWhaleTail();
+    drawEyes(now);
+    drawBrows();
+    drawBlush();
+    drawMouth();
+    drawTear();
+    drawSpout();
+    drawSparkles();
+    drawZzz();
+    drawThinkDots();
+
+    ctx.restore();
+    drawBubbles(1);
+  }
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt, now);
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- 交互 ----------
+  window.addEventListener('pointermove', (e) => {
+    mouse.x = clamp((e.clientX / window.innerWidth) * 2 - 1, -1, 1);
+    mouse.y = clamp((e.clientY / window.innerHeight) * 2 - 1, -1, 1);
+  });
+
+  window.addEventListener('keydown', (e) => {
+    const i = parseInt(e.key, 10);
+    if (i >= 1 && i <= 8) setState(STATE_ORDER[i - 1]);
+    if (e.key === ' ') {
+      e.preventDefault();
+      setState(stateName === 'speak' ? 'idle' : 'speak');
+    }
+  });
+
+  canvas.addEventListener('click', () => {
+    const idx = STATE_ORDER.indexOf(stateName);
+    setState(STATE_ORDER[(idx + 1) % STATE_ORDER.length]);
+  });
+
+  const params = new URLSearchParams(location.search);
+  setState(params.get('state') || 'idle');
+  if (params.get('instant') === '1') {
+    cur = { ...STATE_DEFS[stateName] };
+    blinkAt = performance.now() + 1e7;
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

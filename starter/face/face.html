@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Robot Face — 表情屏原型</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #06070b;
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none;
+  }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; }
+  canvas { width: min(100vw, 166.66vh); height: auto; display: block; cursor: pointer; }
+  #hint {
+    position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+    color: #35424f; font-size: 13px; letter-spacing: .06em; white-space: nowrap;
+  }
+  #stateLabel {
+    position: fixed; top: 14px; right: 18px; color: #3d4d5c;
+    font-size: 12px; letter-spacing: .18em;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="face" width="1200" height="720"></canvas></div>
+<div id="hint">1 待机 · 2 倾听 · 3 思考 · 4 说话 · 5 开心 · 6 难过 · 7 惊讶 · 8 睡觉　（点击画面切换）</div>
+<div id="stateLabel"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('face');
+  const ctx = canvas.getContext('2d');
+  const labelEl = document.getElementById('stateLabel');
+  const W = canvas.width;
+  const H = canvas.height;
+  const CX = W / 2;
+
+  const EYE_Y = H * 0.43;
+  const EYE_DX = W * 0.165;
+  const EYE_W = W * 0.12;
+  const EYE_H = H * 0.16;
+  const MOUTH_Y = H * 0.665;
+
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+
+  // 每个表情就是一组参数，全部平滑插值过渡
+  const STATE_DEFS = {
+    idle:      { eyeOpen: 0.92, pupilX: 0,    pupilY: 0.05,  brow: 0.00,  mouth: 0.04, curve: 0.30,  blush: 0.05, eyeCurve: 0, tilt: 0.000, breathe: 1.00 },
+    listen:    { eyeOpen: 1.06, pupilX: 0,    pupilY: -0.10, brow: 0.22,  mouth: 0.10, curve: 0.22,  blush: 0.10, eyeCurve: 0, tilt: -0.02, breathe: 1.20 },
+    think:     { eyeOpen: 0.72, pupilX: 0.45, pupilY: -0.55, brow: 0.38,  mouth: 0.04, curve: -0.15, blush: 0.00, eyeCurve: 0, tilt: 0.045, breathe: 0.70 },
+    speak:     { eyeOpen: 0.98, pupilX: 0,    pupilY: 0,     brow: 0.10,  mouth: 0.28, curve: 0.35,  blush: 0.10, eyeCurve: 0, tilt: 0.000, breathe: 0.90 },
+    happy:     { eyeOpen: 1.00, pupilX: 0,    pupilY: 0,     brow: 0.50,  mouth: 0.42, curve: 0.95,  blush: 0.65, eyeCurve: 1, tilt: 0.000, breathe: 1.00 },
+    sad:       { eyeOpen: 0.86, pupilX: 0,    pupilY: 0.55,  brow: -0.55, mouth: 0.05, curve: -0.75, blush: 0.00, eyeCurve: 0, tilt: 0.060, breathe: 0.60 },
+    surprised: { eyeOpen: 1.30, pupilX: 0,    pupilY: 0,     brow: 0.85,  mouth: 0.62, curve: 0.05,  blush: 0.15, eyeCurve: 0, tilt: 0.000, breathe: 0.50 },
+    sleep:     { eyeOpen: 0.02, pupilX: 0,    pupilY: 0.2,   brow: -0.18, mouth: 0.03, curve: 0.12,  blush: 0.08, eyeCurve: 0, tilt: 0.090, breathe: 0.35 },
+  };
+  const STATE_ORDER = ['idle', 'listen', 'think', 'speak', 'happy', 'sad', 'surprised', 'sleep'];
+  const STATE_LABELS = {
+    idle: '待机', listen: '倾听', think: '思考', speak: '说话',
+    happy: '开心', sad: '难过', surprised: '惊讶', sleep: '睡觉',
+  };
+
+  let stateName = 'idle';
+  let cur = { ...STATE_DEFS.idle };
+  let tgt = { ...STATE_DEFS.idle };
+
+  const mouse = { x: 0, y: 0 };
+  let elapsed = 0;
+  let last = performance.now();
+
+  // —— 眨眼 ——
+  let blinkAt = performance.now() + 2200;
+  let blinkStart = -1;
+  let blinkDur = 160;
+
+  function blinkFactor(now) {
+    if (blinkStart < 0) return 1;
+    const p = (now - blinkStart) / blinkDur;
+    if (p >= 1) {
+      blinkStart = -1;
+      blinkAt = now + 2200 + Math.random() * 3600;
+      if (Math.random() < 0.22) blinkAt = now + 170; // 偶尔连眨两下
+      return 1;
+    }
+    return Math.abs(Math.cos(Math.PI * p));
+  }
+
+  function scheduleBlink(now) {
+    if (blinkStart < 0 && now >= blinkAt) {
+      blinkStart = now;
+      blinkDur = 130 + Math.random() * 60;
+    }
+  }
+
+  // —— 状态切换 ——
+  function setState(name) {
+    if (!STATE_DEFS[name]) return;
+    stateName = name;
+    labelEl.textContent = STATE_LABELS[name] || name;
+  }
+
+  window.faceAPI = {
+    setState,
+    get state() { return stateName; },
+    // 未来由 Python 调用：faceAPI.setSpeechLevel(0~1) 驱动嘴型
+  };
+
+  // —— 每帧更新 ——
+  function update(dt, now) {
+    scheduleBlink(now);
+    const def = STATE_DEFS[stateName];
+    tgt = { ...def };
+
+    // 待机/倾听时，瞳孔跟随鼠标（将来换成跟随人脸）
+    if (stateName === 'idle' || stateName === 'listen') {
+      tgt.pupilX = mouse.x * 0.35;
+      tgt.pupilY = mouse.y * 0.30;
+    }
+
+    const k = 1 - Math.pow(0.001, dt);
+    for (const key of Object.keys(cur)) {
+      cur[key] = lerp(cur[key], tgt[key] ?? 0, k);
+    }
+
+    elapsed += dt;
+  }
+
+  // —— 绘制 ——
+  function drawBackground() {
+    const bg = ctx.createRadialGradient(CX, H * 0.40, H * 0.05, CX, H * 0.50, W * 0.62);
+    bg.addColorStop(0, '#141b26');
+    bg.addColorStop(0.55, '#0b0f16');
+    bg.addColorStop(1, '#05060a');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawBlush() {
+    const a = cur.blush;
+    if (a <= 0.01) return;
+    for (const side of [-1, 1]) {
+      const x = CX + side * (EYE_DX * 0.95 + EYE_W * 0.18);
+      const y = EYE_Y + EYE_H * 0.55;
+      const r = EYE_W * 0.62;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      g.addColorStop(0, `rgba(255,140,165,${0.75 * a})`);
+      g.addColorStop(1, 'rgba(255,140,165,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBrow(side) {
+    const angle = -side * cur.brow * 0.32;
+    const y = -EYE_H * 0.98 - Math.max(0, cur.brow) * EYE_H * 0.30;
+    ctx.save();
+    ctx.rotate(angle);
+    ctx.strokeStyle = 'rgba(198,234,255,0.72)';
+    ctx.lineWidth = EYE_H * 0.075;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-EYE_W * 0.34, y);
+    ctx.quadraticCurveTo(0, y - EYE_H * 0.09, EYE_W * 0.34, y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawEyes(now) {
+    const blink = blinkFactor(now);
+    const open = clamp(cur.eyeOpen * blink, 0, 1.5);
+
+    for (const side of [-1, 1]) {
+      const x = CX + side * EYE_DX;
+      ctx.save();
+      ctx.translate(x, EYE_Y);
+
+      if (cur.eyeCurve > 0.55) {
+        // 开心：眼睛变成 ^ ^
+        const h = EYE_H * 0.44 * (0.35 + 0.65 * open);
+        ctx.strokeStyle = '#dff7ff';
+        ctx.lineWidth = EYE_H * 0.15;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-EYE_W * 0.40, h * 0.45);
+        ctx.quadraticCurveTo(0, -h, EYE_W * 0.40, h * 0.45);
+        ctx.stroke();
+      } else if (open < 0.08) {
+        // 闭眼
+        ctx.strokeStyle = 'rgba(200,238,255,0.78)';
+        ctx.lineWidth = EYE_H * 0.12;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(-EYE_W * 0.34, 0);
+        ctx.quadraticCurveTo(0, EYE_H * 0.10, EYE_W * 0.34, 0);
+        ctx.stroke();
+      } else {
+        const eh = Math.max(8, EYE_H * open);
+
+        // 眼白（带柔光）
+        ctx.shadowColor = 'rgba(110,215,255,0.50)';
+        ctx.shadowBlur = 34;
+        const g = ctx.createLinearGradient(0, -eh / 2, 0, eh / 2);
+        g.addColorStop(0, '#ffffff');
+        g.addColorStop(0.55, '#ddf5ff');
+        g.addColorStop(1, '#9edcff');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, EYE_W * 0.5, eh * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // 瞳孔
+        const px = cur.pupilX * EYE_W * 0.22;
+        const py = cur.pupilY * eh * 0.20;
+        const pr = Math.min(eh * 0.30, EYE_W * 0.20);
+        ctx.fillStyle = '#0a1b25';
+        ctx.beginPath();
+        ctx.arc(px, py, pr, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 高光
+        ctx.fillStyle = 'rgba(255,255,255,0.92)';
+        ctx.beginPath();
+        ctx.arc(px - pr * 0.32, py - pr * 0.36, pr * 0.28, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      drawBrow(side);
+      ctx.restore();
+    }
+  }
+
+  function drawMouth() {
+    const speech = stateName === 'speak'
+      ? 0.34 * Math.abs(Math.sin(elapsed * 11.0) * Math.sin(elapsed * 5.3 + 0.7))
+      : 0;
+    const m = clamp(cur.mouth + speech, 0, 1);
+    const w = EYE_W * 0.76 * (1 - 0.32 * m);
+    const sag = cur.curve * H * 0.075 + m * H * 0.14;
+    const topSag = -m * H * 0.02;
+
+    ctx.save();
+    ctx.translate(CX, MOUTH_Y);
+
+    const g = ctx.createLinearGradient(0, -12, 0, sag);
+    g.addColorStop(0, 'rgba(120,220,255,0.18)');
+    g.addColorStop(1, 'rgba(8,20,30,0.95)');
+
+    if (m > 0.16 && Math.abs(cur.curve) < 0.45) {
+      // O 型嘴：说话、惊讶
+      const rx = w * 0.62;
+      const ry = Math.max(12, m * H * 0.095);
+      ctx.beginPath();
+      ctx.ellipse(0, ry * 0.32, rx, ry, 0, 0, Math.PI * 2);
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = 'rgba(223,247,255,0.85)';
+      ctx.stroke();
+    } else {
+      // 微笑 / 撇嘴的唇线
+      ctx.beginPath();
+      ctx.moveTo(-w, 0);
+      ctx.quadraticCurveTo(0, sag, w, 0);
+      ctx.quadraticCurveTo(0, topSag, -w, 0);
+      ctx.closePath();
+      ctx.fillStyle = g;
+      ctx.fill();
+
+      ctx.lineWidth = 6;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = 'rgba(223,247,255,0.85)';
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function draw(now) {
+    drawBackground();
+
+    const breathe = Math.sin(elapsed * 1.5) * 0.004 * (cur.breathe || 1);
+    const bob = Math.sin(elapsed * 1.1) * 3 * (cur.breathe || 1)
+              + (stateName === 'speak' ? Math.sin(elapsed * 8.5) * 2 : 0);
+
+    ctx.save();
+    ctx.translate(CX, H * 0.5);
+    ctx.rotate(cur.tilt);
+    ctx.scale(1 + breathe, 1 + breathe);
+    ctx.translate(-CX, -H * 0.5 + bob);
+
+    drawBlush();
+    drawEyes(now);
+    drawMouth();
+
+    ctx.restore();
+  }
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt, now);
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  // —— 交互 ——
+  window.addEventListener('pointermove', (e) => {
+    mouse.x = clamp((e.clientX / window.innerWidth) * 2 - 1, -1, 1);
+    mouse.y = clamp((e.clientY / window.innerHeight) * 2 - 1, -1, 1);
+  });
+
+  window.addEventListener('keydown', (e) => {
+    const i = parseInt(e.key, 10);
+    if (i >= 1 && i <= 8) setState(STATE_ORDER[i - 1]);
+    if (e.key === ' ') {
+      e.preventDefault();
+      setState(stateName === 'speak' ? 'idle' : 'speak');
+    }
+  });
+
+  canvas.addEventListener('click', () => {
+    const idx = STATE_ORDER.indexOf(stateName);
+    setState(STATE_ORDER[(idx + 1) % STATE_ORDER.length]);
+  });
+
+  // 支持 ?state=happy 直接打开某个表情；?instant=1 跳过过渡（截图/调试用）
+  const params = new URLSearchParams(location.search);
+  setState(params.get('state') || 'idle');
+  if (params.get('instant') === '1') {
+    cur = { ...STATE_DEFS[stateName] };
+    blinkAt = performance.now() + 1e7;
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
